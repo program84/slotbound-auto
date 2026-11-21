@@ -49,6 +49,7 @@ CONFIG_PATH = os.path.join(BASE, "slotbot.json")
 LOG_PATH = os.path.join(BASE, "slotbot.log")
 
 GRID_X, GRID_Y = 16, 9
+SPOT_GRID = 8
 TOL = 18.0
 VK_F8 = 0x77
 MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP = 0x0002, 0x0004
@@ -83,12 +84,83 @@ def minimize_console() -> None:
         user32.ShowWindow(hwnd, 6)
 
 
-def click(x, y) -> None:
-    user32.SetCursorPos(int(x), int(y))
-    time.sleep(0.02)
-    user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-    time.sleep(0.03)
-    user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_void_p)]
+
+
+class INPUT(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT)]
+
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+
+def click(x: int, y: int) -> None:
+    """用 SendInput 发送真实鼠标输入。
+
+    mouse_event 是废弃接口，不少全屏游戏（尤其 SDL / LÖVE 引擎）会忽略它：
+    光标看着动了，游戏却收不到点击。SendInput 走的是系统输入队列，
+    和真实硬件事件同一路径，兼容性好得多。
+    """
+    x, y = int(x), int(y)
+    user32.SetCursorPos(x, y)          # 先让光标可见地移过去
+    time.sleep(0.05)
+
+    vx = user32.GetSystemMetrics(76)
+    vy = user32.GetSystemMetrics(77)
+    vw = max(user32.GetSystemMetrics(78) - 1, 1)
+    vh = max(user32.GetSystemMetrics(79) - 1, 1)
+    nx = int((x - vx) * 65535 / vw)
+    ny = int((y - vy) * 65535 / vh)
+
+    base = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+    events = (INPUT * 2)()
+    for i, extra in enumerate((MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)):
+        events[i].type = 0             # INPUT_MOUSE
+        events[i].u.mi.dx = nx
+        events[i].u.mi.dy = ny
+        events[i].u.mi.dwFlags = base | extra
+
+    user32.SendInput(1, ctypes.byref(events[0]), ctypes.sizeof(INPUT))
+    time.sleep(0.04)
+    user32.SendInput(1, ctypes.byref(events[1]), ctypes.sizeof(INPUT))
+
+
+def focus_window(title_part: str) -> bool:
+    """把标题包含 title_part 的窗口切到前台。"""
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def cb(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        n = user32.GetWindowTextLengthW(hwnd)
+        if n <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(n + 1)
+        user32.GetWindowTextW(hwnd, buf, n + 1)
+        if title_part.lower() in buf.value.lower():
+            found.append(hwnd)
+            return False
+        return True
+
+    try:
+        user32.EnumWindows(cb, 0)
+    except Exception:
+        pass
+    if found:
+        user32.ShowWindow(found[0], 9)      # SW_RESTORE
+        user32.SetForegroundWindow(found[0])
+        return True
+    return False
 
 
 def stop_pressed() -> bool:
@@ -117,9 +189,16 @@ def screen_sig(arr: np.ndarray) -> np.ndarray:
 
 
 def spot_sig(arr: np.ndarray, box) -> np.ndarray:
-    """一小块区域的平均色。"""
+    """一小块区域压成 SPOT_GRID x SPOT_GRID 个平均色块。
+
+    只取整体平均色是不够的：颜色均匀的区域不管有没有目标，平均值都一样，
+    误差恒为 0，判定就永远成立。切成格子才能看出"形状"差异。
+    """
     x, y, bw, bh = box
-    return arr[y:y + bh, x:x + bw].reshape(-1, 3).mean(axis=0)
+    patch = arr[y:y + bh, x:x + bw]
+    gh = gw = SPOT_GRID
+    ch, cw = max(1, bh // gh), max(1, bw // gw)
+    return patch[:ch * gh, :cw * gw].reshape(gh, ch, gw, cw, 3).mean(axis=(1, 3))
 
 
 def load_screen_ref(path: str) -> np.ndarray:
@@ -184,6 +263,8 @@ DEFAULT_CONFIG = {
     "poll_interval": 0.3,
     "click_jitter": [0.45, 1.0],
     "park": [960, 620],
+    "window_title": "Slotbound",
+    "focus_window": True,
     "states": [
         {
             "name": "decision",
@@ -265,11 +346,18 @@ def run(cfg, dry_run=False, verbose=False, minimize=True):
         minimize_console()
         log("（已最小化。玩完按 F8 停止，回来看 slotbot.log）")
 
+    if cfg.get("focus_window", True):
+        if focus_window(cfg.get("window_title", "Slotbound")):
+            log("已把游戏窗口切到前台")
+        else:
+            log("没找到游戏窗口，请自己切到游戏")
+
     interval = float(cfg.get("poll_interval", 0.3))
     jitter = cfg.get("click_jitter", [0.45, 1.0])
     park = cfg.get("park")
     next_ok = {s["name"]: 0.0 for s, _, _ in states}
     armed = {s["name"]: True for s, _, _ in states}
+    last_click = {s["name"]: 0.0 for s, _, _ in states}
     last_hit = None
     last_print = 0.0
 
@@ -295,6 +383,10 @@ def run(cfg, dry_run=False, verbose=False, minimize=True):
                 log("  " + "  ".join(f"{k}={v:.1f}" for k, v in diffs.items())
                     + (f"   -> {chosen[0]['name']} ✓" if chosen else "   -> 无"))
                 last_print = now
+            elif not verbose and now - last_print > 2.0:
+                log("  " + "  ".join(f"{k}={v:.1f}" for k, v in diffs.items())
+                    + (f"   -> {chosen[0]['name']} ✓" if chosen else "   -> 无"))
+                last_print = now
 
             if chosen is None:
                 for name in armed:
@@ -315,8 +407,13 @@ def run(cfg, dry_run=False, verbose=False, minimize=True):
                 time.sleep(interval)
                 continue
             if st.get("edge") and not armed[name]:
-                time.sleep(interval)
-                continue
+                rearm = float(st.get("edge_rearm", 5.0))
+                if now - last_click.get(name, 0.0) >= rearm:
+                    armed[name] = True
+                    log(f"[{name}] 已锁定 {rearm:.0f} 秒仍无变化，自动解锁重试")
+                else:
+                    time.sleep(interval)
+                    continue
 
             clicks = st.get("clicks") or []
             if not clicks:
@@ -330,10 +427,14 @@ def run(cfg, dry_run=False, verbose=False, minimize=True):
                 if park:
                     user32.SetCursorPos(int(park[0]), int(park[1]))
             armed[name] = False
+            last_click[name] = now
             next_ok[name] = now + float(st.get("cooldown", 1.5))
             time.sleep(random.uniform(*jitter))
     except KeyboardInterrupt:
         pass
+    except Exception:
+        import traceback
+        log("运行出错：\n" + traceback.format_exc())
     log("已停止。")
 
 
